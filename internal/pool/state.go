@@ -421,30 +421,66 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	return p.pickByUID(uid, model, true)
+}
+
+// pickByUID 是粘性直取的两阶段实现：RLock 下做健康/保底/在途校验（floorBlocked
+// 可能回调上游 modelRateOf→effortsMu，不能在写锁内跨包拿锁），短 Lock 内复检并
+// 租约。forModel=true 用 healthyForModel（6004 模型豁免），false 用账号级 healthy。
+func (p *Pool) pickByUID(uid, model string, forModel bool) *auth.Auth {
+	// Phase 1：RLock 校验。
+	p.mu.RLock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.RUnlock()
 		return nil
 	}
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
+	okHealthy := e.healthy(now)
+	if forModel {
+		okHealthy = e.healthyForModel(now, model)
+	}
+	// paidBlocked 已含本地台账 + 上游倍率判定（RLock 下完成跨包回调）。
+	var paidBlocked bool
+	if okHealthy && forModel {
+		paidBlocked = p.floorBlockedForRealmModel(e, model, e.a.Realm(), now)
+	}
+	full := p.inFlightFull(e)
+	creds, floor := e.credits, p.creditFloor
+	p.mu.RUnlock()
+	if !okHealthy || paidBlocked || full {
+		if paidBlocked {
+			// 积分保底（粘性路径）：日志在锁外打，频次天然每请求至多一条——首次返回
+			// nil 即解绑，后续轮转不再调入本路径。
+			log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+				logfmt.Label(e.a.UID, e.a.Nickname), model, creds, floor)
+		}
 		return nil
 	}
-	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
-	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
-	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
-	// 后下次会话重新绑定。
-	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
-	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
-	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
-		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
-		return nil
+	// Phase 2：短 Lock 复检（等锁期间可能刚被冷却/占满）并租约。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now = time.Now()
+	if forModel {
+		// 写锁内不再回调上游倍率（避免持 p.mu 跨包拿 effortsMu）：只复检本地实时
+		// 状态（健康/在途）+ 本地实测台账（modelCostOf 不跨包）。Phase 1 已完成含
+		// 上游倍率兜底的权威判定；Phase 1→2 之间状态只可能变差不会变好，故本地
+		// 台账复检足以防 TOCTOU，倍率维度不复查（窗口期变化只影响后续请求）。
+		if !e.healthyForModel(now, model) || p.inFlightFull(e) {
+			return nil
+		}
+		if floor > 0 && e.credits < floor {
+			if mc, ok := e.modelCostOf(model, now); ok && mc.CostPer1k > 0 {
+				return nil
+			}
+		}
+	} else {
+		if !e.healthy(now) || p.inFlightFull(e) {
+			return nil
+		}
 	}
-	if p.inFlightFull(e) {
-		return nil
-	}
+	e.pruneExpiredModelCooldowns(now)
+	e.pruneExpiredModelCosts(now)
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
@@ -454,23 +490,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-	now := time.Now()
-	if !e.healthy(now) {
-		return nil
-	}
-	if p.inFlightFull(e) {
-		return nil
-	}
-	e.lastUsed = now
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
-	return e.a
+	return p.pickByUID(uid, "", false)
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
