@@ -1252,3 +1252,47 @@ func TestStreamWithoutMarkupRepairIsUnchanged(t *testing.T) {
 		t.Fatalf("未声明 tools 时输出被改动\nbase=%s\ngot =%s", base.Body.String(), disabled.Body.String())
 	}
 }
+
+// discardRW 是最小 http.ResponseWriter 实现：Body 丢弃、Flush 空转，
+// 供 StreamHint 基准测试使用（不关心出站字节，只测处理路径分配）。
+type discardRW struct{}
+
+func (discardRW) Header() http.Header         { return http.Header{} }
+func (discardRW) Write(p []byte) (int, error) { return len(p), nil }
+func (discardRW) WriteHeader(int)             {}
+func (discardRW) Flush()                      {}
+
+// BenchmarkStreamHint50Frames 度量 50 帧透传流的处理分配。
+// 池化前每帧的 "data: "+payload+"\n\n" 拼串 + marshal 后的 []byte→string 拷贝
+// + 每帧 6 元素 key 切片都会进堆；改动后这些应被池化/提升消除。
+func BenchmarkStreamHint50Frames(b *testing.B) {
+	var sb strings.Builder
+	frame := func(content string) string {
+		obj := map[string]any{
+			"id":      "chatcmpl-bench",
+			"object":  "chat.completion.chunk",
+			"created": 1700000000,
+			"model":   "cn:auto",
+			"choices": []any{map[string]any{
+				"index": 0,
+				"delta": map[string]any{"content": content},
+			}},
+		}
+		raw, _ := json.Marshal(obj)
+		return "data: " + string(raw) + "\n\n"
+	}
+	for i := 0; i < 50; i++ {
+		sb.WriteString(frame("hello world token payload chunk"))
+	}
+	sb.WriteString("data: [DONE]\n\n")
+	input := sb.String()
+
+	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := StreamHint(discardRW{}, strings.NewReader(input), nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
