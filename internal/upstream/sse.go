@@ -10,8 +10,63 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+// sseDataPrefix / sseFrameSuffix 是 SSE 帧的固定包装（data: 与空行收尾）。
+var (
+	sseDataPrefix  = []byte("data: ")
+	sseFrameSuffix = []byte("\n\n")
+)
+
+// sseFrameBufPool 复用帧写出缓冲：热路径上每个 token 帧此前都要为
+// "data: "+payload+"\n\n" 的字符串拼接分配一个新字符串，且 marshal 产物还需一次
+// []byte→string 拷贝。改为池化 []byte 顺序追加、单次 Write 后归还——每帧省掉
+// 1~2 次堆分配。Write 同步消费缓冲（net/http 内部拷贝），返回后归还安全。
+var sseFrameBufPool = sync.Pool{New: func() any {
+	b := make([]byte, 0, 8*1024)
+	return &b
+}}
+
+// writeSSEFrame 把 payload（字符串形态）包装成一帧 SSE 写出并 flush。
+func writeSSEFrame(w io.Writer, fl http.Flusher, payload string) error {
+	bp := sseFrameBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	buf = append(buf, sseDataPrefix...)
+	buf = append(buf, payload...)
+	buf = append(buf, sseFrameSuffix...)
+	_, err := w.Write(buf)
+	*bp = buf // 保留增长后的容量供下次复用
+	sseFrameBufPool.Put(bp)
+	if err != nil {
+		return err
+	}
+	if fl != nil {
+		fl.Flush()
+	}
+	return nil
+}
+
+// writeSSEFrameBytes 同 writeSSEFrame，但直接消费 marshal 产物 []byte，
+// 省掉 string(raw) 的一次拷贝。
+func writeSSEFrameBytes(w io.Writer, fl http.Flusher, payload []byte) error {
+	bp := sseFrameBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	buf = append(buf, sseDataPrefix...)
+	buf = append(buf, payload...)
+	buf = append(buf, sseFrameSuffix...)
+	_, err := w.Write(buf)
+	*bp = buf
+	sseFrameBufPool.Put(bp)
+	if err != nil {
+		return err
+	}
+	if fl != nil {
+		fl.Flush()
+	}
+	return nil
+}
 
 // errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
 // 用哨兵错误替代裸 fmt.Errorf：StreamHint 的调用方（handler 流式路径）需要区分
@@ -384,13 +439,21 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 	}
 }
 
+// normalizeFrameTopLevelKeys 是 normalizeFrame 白名单透传的固定顶层字段列表：
+// 提到包级避免每帧分配一次 6 元素切片。
+var normalizeFrameTopLevelKeys = []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"}
+
+// markupFrameCopyKeys 是合成帧从源帧借用的字段（created/model），
+// markupCallFrame 与 finishOnlyFrame 共用同一份只读切片。
+var markupFrameCopyKeys = []string{"created", "model"}
+
 // normalizeFrame 以 OpenAI 流式规范白名单重建帧：仅保留标准字段，
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
 // usage 缺失 → null，保证任意标准客户端按规范解析。
 func normalizeFrame(obj map[string]any) map[string]any {
 	out := map[string]any{}
-	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
+	for _, k := range normalizeFrameTopLevelKeys {
 		if v, ok := obj[k]; ok && v != nil {
 			out[k] = v
 		}
@@ -546,13 +609,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	// writeSSE 原样写出一帧并 flush。
 	writeSSE := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return writeSSEFrame(w, fl, payload)
 	}
 
 	// writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -609,7 +666,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if err != nil {
 			return writeSSE(fallback)
 		}
-		return writeSSE(string(raw))
+		return writeSSEFrameBytes(w, fl, raw)
 	}
 
 	// repairFrame 在透传前跑标记修复，并把一帧展开成「可能多帧」：正文帧（标记被摘掉
@@ -865,7 +922,7 @@ func markupCallFrame(src map[string]any, idx int, call MarkupCall) map[string]an
 			},
 		}},
 	}
-	for _, k := range []string{"created", "model"} {
+	for _, k := range markupFrameCopyKeys {
 		if v, ok := src[k]; ok && v != nil {
 			frame[k] = v
 		}
@@ -883,7 +940,7 @@ func finishOnlyFrame(src map[string]any, finish string) map[string]any {
 			"finish_reason": finish,
 		}},
 	}
-	for _, k := range []string{"created", "model"} {
+	for _, k := range markupFrameCopyKeys {
 		if v, ok := src[k]; ok && v != nil {
 			frame[k] = v
 		}

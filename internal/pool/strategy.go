@@ -105,10 +105,10 @@ func (p *Pool) restoreSchedulingLocked(cursors map[string]scheduleCursor) {
 	}
 }
 
-// pickOrderedLocked 接收已完成健康、保底、在途与成本层过滤的全量候选。
-// 临时 tried/在途占满/成本探索可借用其他账号，但不推进顺序耗尽的主账号。
-// 调用方持 p.mu；指针按 (realm, model) 隔离，并通过既有快照机制持久化。
-func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, realm, strategy string, explored bool, now time.Time) *entry {
+// uidLessLocked 按「配置的地区账号顺序优先，缺席者退回 uid 字典序」比较两个 uid。
+// pickOrderedLocked 与两阶段选号的 Phase 1（RLock 快照排序）共用同一口径。
+// 调用方持 p.mu（读 accountOrder）。
+func (p *Pool) uidLessLocked(a, b, realm string) bool {
 	order := p.accountOrder.Domestic
 	if realm == "global" {
 		order = p.accountOrder.International
@@ -119,18 +119,22 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 			rank[uid] = len(rank)
 		}
 	}
-	lessUID := func(a, b string) bool {
-		ar, aok := rank[a]
-		br, bok := rank[b]
-		if aok != bok {
-			return aok
-		}
-		if aok {
-			return ar < br
-		}
-		return a < b
+	ar, aok := rank[a]
+	br, bok := rank[b]
+	if aok != bok {
+		return aok
 	}
-	sort.Slice(cands, func(i, j int) bool { return lessUID(cands[i].a.UID, cands[j].a.UID) })
+	if aok {
+		return ar < br
+	}
+	return a < b
+}
+
+// pickOrderedLocked 接收已完成健康、保底、在途与成本层过滤的全量候选。
+// 临时 tried/在途占满/成本探索可借用其他账号，但不推进顺序耗尽的主账号。
+// 调用方持 p.mu；指针按 (realm, model) 隔离，并通过既有快照机制持久化。
+func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, realm, strategy string, explored bool, now time.Time) *entry {
+	sort.Slice(cands, func(i, j int) bool { return p.uidLessLocked(cands[i].a.UID, cands[j].a.UID, realm) })
 	key := realm + "\x1f" + model
 	cursor := p.scheduling[key]
 	if cursor.Strategy != strategy {
@@ -149,7 +153,7 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 		selected = cands[0]
 		if cursor.UID != "" {
 			for _, e := range cands {
-				if lessUID(cursor.UID, e.a.UID) {
+				if p.uidLessLocked(cursor.UID, e.a.UID, realm) {
 					selected = e
 					break
 				}
